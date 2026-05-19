@@ -128,6 +128,7 @@ def xfoilAnalysis(cfg,polardir,filename):
 def _xfoilSingleRe(Re,polar,filename,polardir,cfg):
     commands= (
         f"LOAD {filename}.dat\n"
+        f"PANE\n"
         f"OPER\n"
         f"ITER\n"
         f"200\n"
@@ -136,7 +137,7 @@ def _xfoilSingleRe(Re,polar,filename,polardir,cfg):
         f"PACC\n{polar}\n\n"
         f"ASEQ -4 12 .5\n"
         f"PACC\n"
-        f"QUIT\n"
+        f"\nQUIT\n"
         )
     try:
         results = subprocess.run(
@@ -153,9 +154,12 @@ def _xfoilSingleRe(Re,polar,filename,polardir,cfg):
         return (Re, polar)
     else:
         return (Re, None)
-     
+def parseData(results):
+    with open(results, 'r') as r:
+        r.readlines()
+        
+             
 #here we start the program provide the function with its params and sit printing profile
-
 M=4
 P=4
 T=12
@@ -168,7 +172,7 @@ coords,perimeter,thickness,xu = paraGen(M,P,T)
 Re,chord_grid,span_grid, Velocity,mass=buildDesignSpace(perimeter,cfg)
 valid_chords,validpercent=mfCheck(cfg,thickness,xu)
 filename,name=writeAirfoil(coords,M,P,T,polardir)
-xfoilAnalysis(cfg,polardir,name)
+results = xfoilAnalysis(cfg,polardir,name)
 
 
 #debugging 
