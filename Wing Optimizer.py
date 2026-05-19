@@ -77,7 +77,6 @@ def paraGen(M,P,T, n=200):
     perimeter=upperlength+lowerlength
     thickness= yu-yl
     return coords, perimeter, thickness,xu
-
 def buildDesignSpace(perimeter, cfg):
     #Create grid for design space
     chord_grid,span_grid=np.meshgrid(cfg.chordconfig,cfg.spanconfig)
@@ -92,7 +91,6 @@ def buildDesignSpace(perimeter, cfg):
     Velocity=np.sqrt((2*mass_kg*9.81)/(rho*wingArea_m2*cfg.Cl_init))
     Re=Velocity*(chord_grid/1000)/(1.48e-5)
     return Re,chord_grid,span_grid,Velocity,mass
-
 def mfCheck(cfg,thickness,xu):
     thickness_mm=thickness[:,np.newaxis]*cfg.chordconfig
     printable = thickness_mm >= cfg.printable
@@ -102,7 +100,6 @@ def mfCheck(cfg,thickness,xu):
     validchords = cfg.chordconfig[validbool]
     validpercent = np.sum(validbool)/validbool.size
     return validchords, validpercent
-
 def writeAirfoil(coords,M,P,T,polardir):
     name= f'NACA{M}{P}{T:02d}'
     filename=f'{name}.dat'
@@ -124,7 +121,7 @@ def xfoilAnalysis(cfg,polardir,filename):
             Re,polar=future.result()
             if polar is not None:
                 results[Re]=polar
-    return results
+    return results,resweep
 def _xfoilSingleRe(Re,polar,filename,polardir,cfg):
     commands= (
         f"LOAD {filename}.dat\n"
@@ -154,11 +151,46 @@ def _xfoilSingleRe(Re,polar,filename,polardir,cfg):
         return (Re, polar)
     else:
         return (Re, None)
-def parseData(results):
-    with open(results, 'r') as r:
-        r.readlines()
-        
-             
+def _parseData(resultspath):
+    with open(resultspath, 'r') as r:
+        lines = r.readlines()
+        for i, line in enumerate(lines):
+            if line.strip().startswith('---'):
+                data_start = i+1
+                break
+        if data_start >= len(lines):
+            return None
+        alpha_list=[]
+        CL_list=[]
+        CD_list=[]
+        CM_list=[]
+        for data in lines[data_start:]:
+            datarow = data.split()
+            alpha_list.append(float(datarow[0]))
+            CL_list.append(float(datarow[1]))
+            CD_list.append(float(datarow[2]))
+            CM_list.append(float(datarow[4]))
+    return np.array(alpha_list),np.array(CL_list),np.array(CD_list),np.array(CM_list)
+def polarTable(results,polardir):
+    table={}
+    for Re, polarfiles in sorted(results.items()):
+        parsed = _parseData(os.path.join(polardir,polarfiles))
+        if parsed is not None:
+            table[Re]=parsed
+    return table
+def findOperatingPoint(table):
+    Re_keys=sorted(table.keys())
+    bestmetric =0
+    best_result = None
+    for Re in Re_keys:
+        alpha_list, CL_list, CD_list, CM_list = table[Re]
+        metric = CL_list**1.5/CD_list
+        idx = np.argmax(metric)
+        if metric[idx] > bestmetric:
+            bestmetric=metric[idx]
+            best_result = (Re,alpha_list[idx],CL_list[idx],CD_list[idx],CM_list[idx])
+    Velocity = sqrt(2*)
+    return bestmetric,best_result
 #here we start the program provide the function with its params and sit printing profile
 M=4
 P=4
@@ -172,7 +204,8 @@ coords,perimeter,thickness,xu = paraGen(M,P,T)
 Re,chord_grid,span_grid, Velocity,mass=buildDesignSpace(perimeter,cfg)
 valid_chords,validpercent=mfCheck(cfg,thickness,xu)
 filename,name=writeAirfoil(coords,M,P,T,polardir)
-results = xfoilAnalysis(cfg,polardir,name)
+results,resweep = xfoilAnalysis(cfg,polardir,name)
+table=polarTable(results,polardir)
 
 
 #debugging 
