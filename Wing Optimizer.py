@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import namedtuple
 import numpy as np
 import matplotlib.pyplot as plt
 import os
@@ -22,16 +23,19 @@ class SweepConfig:
     density= .00054 #g/mm^3
     wall_thickness=.56
     #design space steps 
-    span_min=10
+    span_min=12
     span_max=256*3
+    span_steps=14
     chord_min=10
     chord_max=230
-    datapoints=50
+    chord_steps=5
     Cl_init=.5
     valid_glide=4
     printable = .42
-    chordconfig= np.linspace(chord_min,chord_max,datapoints)
-    spanconfig=np.linspace(span_min,span_max,datapoints)
+    chordconfig= np.arange(chord_min,chord_max,chord_steps)
+    chordconfig= np.append(chordconfig,chord_max)
+    spanconfig=np.arange(span_min,span_max,span_steps)
+    spanconfig = np.append(spanconfig,span_max)
     maxtrunc:float = .02
     
     #MPXX max camber/100 p for position of max camber /10 and XX for thickness /100; using T for XX
@@ -81,9 +85,6 @@ def buildDesignSpace(perimeter, cfg):
     #Create grid for design space
     chord_grid,span_grid=np.meshgrid(cfg.chordconfig,cfg.spanconfig)
     mass=perimeter*chord_grid*span_grid*cfg.density*cfg.wall_thickness
-    #
-    wingArea=span_grid*chord_grid
-    
     #unit correction
     wingArea_m2=(chord_grid/1000)*(span_grid/1000)
     mass_kg = mass/1000
@@ -99,7 +100,7 @@ def mfCheck(cfg,thickness,xu):
     validbool = percent <= cfg.maxtrunc
     validchords = cfg.chordconfig[validbool]
     validpercent = np.sum(validbool)/validbool.size
-    return validchords, validpercent
+    return validbool, validpercent
 def writeAirfoil(coords,M,P,T,polardir):
     name= f'NACA{M}{P}{T:02d}'
     filename=f'{name}.dat'
@@ -136,6 +137,9 @@ def _xfoilSingleRe(Re,polar,filename,polardir,cfg):
         f"PACC\n"
         f"\nQUIT\n"
         )
+    polarpath = os.path.join(polardir, polar)
+    if os.path.exists(polarpath):
+        os.remove(polarpath)
     try:
         results = subprocess.run(
             ["xfoil"],
@@ -173,24 +177,78 @@ def _parseData(resultspath):
     return np.array(alpha_list),np.array(CL_list),np.array(CD_list),np.array(CM_list)
 def polarTable(results,polardir):
     table={}
+    Polar= namedtuple("Polar", ["alpha","CL","CD","CM"])
     for Re, polarfiles in sorted(results.items()):
         parsed = _parseData(os.path.join(polardir,polarfiles))
         if parsed is not None:
-            table[Re]=parsed
+            table[Re]=Polar(*parsed)
     return table
-def findOperatingPoint(table):
+def _findOperatingPoint(table,ReTheoretical):
+    # 0=alpha, 1=CL, 2=CD, 3=CM
     Re_keys=sorted(table.keys())
-    bestmetric =0
-    best_result = None
-    for Re in Re_keys:
-        alpha_list, CL_list, CD_list, CM_list = table[Re]
-        metric = CL_list**1.5/CD_list
-        idx = np.argmax(metric)
-        if metric[idx] > bestmetric:
-            bestmetric=metric[idx]
-            best_result = (Re,alpha_list[idx],CL_list[idx],CD_list[idx],CM_list[idx])
-    Velocity = sqrt(2*)
-    return bestmetric,best_result
+    ReTheoretical =float(np.clip(ReTheoretical, Re_keys[0], Re_keys[-1]))
+    for xfoilRe in Re_keys:
+        if ReTheoretical > xfoilRe:
+            xlower = xfoilRe
+        else:
+            xupper = xfoilRe
+            break
+    if Re_keys[0] == xfoilRe or Re_keys[-1] == xfoilRe:
+        interCL = table[xfoilRe].CL
+        interCM = table[xfoilRe].CM
+        interCD = table[xfoilRe].CD
+    else:
+        alpha_lower = table[xlower].alpha
+        alpha_upper = table[xupper].alpha
+        alpha_common = np.intersect1d(alpha_lower, alpha_upper)
+        CL_lower = table[xlower].CL[np.isin(alpha_lower, alpha_common)]
+        CL_upper = table[xupper].CL[np.isin(alpha_upper, alpha_common)]
+        CD_lower = table[xlower].CD[np.isin(alpha_lower, alpha_common)]
+        CD_upper = table[xupper].CD[np.isin(alpha_upper, alpha_common)]
+        CM_lower = table[xlower].CM[np.isin(alpha_lower, alpha_common)]
+        CM_upper = table[xupper].CM[np.isin(alpha_upper, alpha_common)]
+        interCL = (CL_upper-CL_lower)/(xupper-xlower)*(ReTheoretical-xlower)+CL_lower
+        interCM = (CM_upper-CM_lower)/(xupper-xlower)*(ReTheoretical-xlower)+CM_lower
+        interCD = (CD_upper-CD_lower)/(xupper-xlower)*(ReTheoretical-xlower)+CD_lower
+    interSink = interCL**1.5/interCD
+    idx = np.argmax(interSink)
+   # if interCL[idx] <= 0 or interCD[idx] <= 0:
+    #    return None
+    interMetrics = [ReTheoretical,interCL[idx],interCM[idx],interCD[idx],interSink[idx]]
+ 
+    return interMetrics
+def scoreCandidates(validbool,chord_grid,span_grid,Velocity,mass,Re,table):
+    results= []
+    for i in range(span_grid.shape[0]):
+        for j in range(np.argmax(validbool),chord_grid.shape[1]):
+            if not validbool[j]:
+                continue
+            testRe=Re[i,j]
+            _repeat=True
+            max_iter=500
+            _iter=0
+            while _repeat:
+                interMetrics = _findOperatingPoint(table,testRe)
+                if interMetrics is None:
+                    break
+                V = np.sqrt(2*mass[i,j]*9.81 / (1.225 * (chord_grid[i,j]/1000) * (span_grid[i,j]/1000) * interMetrics[1]))
+                Re_new = V * (chord_grid[i,j]/1000)/1.48e-5
+                if abs(Re_new - testRe)/testRe < .05:
+                    _repeat = False
+                    if interMetrics[2]>-.15:
+                        results.append((interMetrics[4],chord_grid[i,j],span_grid[i,j],interMetrics[0],interMetrics[1],interMetrics[2],interMetrics[3]))
+                elif _iter >= max_iter:
+                    _repeat= False
+                    
+                else:
+                    testRe = 0.7*testRe + .3*Re_new
+                    _iter += 1
+                    print("converge")
+    
+    #if not results:
+     #   return None
+    results.sort(reverse=True)
+    return results[:5]
 #here we start the program provide the function with its params and sit printing profile
 M=4
 P=4
@@ -202,11 +260,12 @@ polardir = os.path.join(workdir, f"NACA{M}{P}{T:02d}")
 os.makedirs(polardir, exist_ok=True)
 coords,perimeter,thickness,xu = paraGen(M,P,T)
 Re,chord_grid,span_grid, Velocity,mass=buildDesignSpace(perimeter,cfg)
-valid_chords,validpercent=mfCheck(cfg,thickness,xu)
+validbool,validpercent=mfCheck(cfg,thickness,xu)
 filename,name=writeAirfoil(coords,M,P,T,polardir)
 results,resweep = xfoilAnalysis(cfg,polardir,name)
 table=polarTable(results,polardir)
-
+results=scoreCandidates(validbool,chord_grid,span_grid,Velocity,mass,Re,table)
+print(results)
 
 #debugging 
 np.savetxt('weight_grid.csv', mass, delimiter=',', fmt='%.5g')
