@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import namedtuple
 import numpy as np
@@ -7,7 +7,7 @@ import os
 import subprocess 
 @dataclass
 class SweepConfig:
-    reynolds_min:float = 30_000
+    reynolds_min:float = 20_000
     reynolds_max:float = 70_000
     reynolds_steps:int = 5_000
     n_crit: float      = 5.5
@@ -17,8 +17,8 @@ class SweepConfig:
     P_min = 2
     P_max = 5
     P_step = 1
-    T_min = 8
-    T_max = 14
+    T_min = 6
+    T_max = 24
     T_step = 2
     density= .00054 #g/mm^3
     wall_thickness=.56
@@ -30,7 +30,7 @@ class SweepConfig:
     chord_max=230
     chord_steps=5
     Cl_init=.5
-    valid_glide=4
+    valid_glide=5
     printable = .42
     chordconfig= np.arange(chord_min,chord_max,chord_steps)
     chordconfig= np.append(chordconfig,chord_max)
@@ -95,10 +95,9 @@ def buildDesignSpace(perimeter, cfg):
 def mfCheck(cfg,thickness,xu):
     thickness_mm=thickness[:,np.newaxis]*cfg.chordconfig
     printable = thickness_mm >= cfg.printable
-    lastchord_valid=(200-1) - np.argmax(printable[::-1], axis=0)
+    lastchord_valid=(len(xu)-1) - np.argmax(printable[::-1], axis=0)
     percent = 1.0 - xu[lastchord_valid]
     validbool = percent <= cfg.maxtrunc
-    validchords = cfg.chordconfig[validbool]
     validpercent = np.sum(validbool)/validbool.size
     return validbool, validpercent
 def writeAirfoil(coords,M,P,T,polardir):
@@ -183,7 +182,7 @@ def polarTable(results,polardir):
         if parsed is not None:
             table[Re]=Polar(*parsed)
     return table
-def _findOperatingPoint(table,ReTheoretical):
+def _findOperatingPoint(table,ReTheoretical,chord,span):
     # 0=alpha, 1=CL, 2=CD, 3=CM
     Re_keys=sorted(table.keys())
     ReTheoretical =float(np.clip(ReTheoretical, Re_keys[0], Re_keys[-1]))
@@ -193,10 +192,10 @@ def _findOperatingPoint(table,ReTheoretical):
         else:
             xupper = xfoilRe
             break
-    if Re_keys[0] == xfoilRe or Re_keys[-1] == xfoilRe:
-        interCL = table[xfoilRe].CL
-        interCM = table[xfoilRe].CM
-        interCD = table[xfoilRe].CD
+    if Re_keys[0] == ReTheoretical or Re_keys[-1] == ReTheoretical:
+        interCL = table[ReTheoretical].CL
+        interCM = table[ReTheoretical].CM
+        interCD = table[ReTheoretical].CD
     else:
         alpha_lower = table[xlower].alpha
         alpha_upper = table[xupper].alpha
@@ -210,14 +209,18 @@ def _findOperatingPoint(table,ReTheoretical):
         interCL = (CL_upper-CL_lower)/(xupper-xlower)*(ReTheoretical-xlower)+CL_lower
         interCM = (CM_upper-CM_lower)/(xupper-xlower)*(ReTheoretical-xlower)+CM_lower
         interCD = (CD_upper-CD_lower)/(xupper-xlower)*(ReTheoretical-xlower)+CD_lower
-    interSink = interCL**1.5/interCD
+    valid = (interCL > 0) & (interCD > 0)
+    if not np.any(valid):
+        return None
+    AR=span/chord
+    e = .75
+    CD_induced = interCL**2/(np.pi*AR*e)
+    CD_total = interCD + CD_induced
+    interSink = np.where(valid, interCL**1.5/CD_total, 0)
     idx = np.argmax(interSink)
-   # if interCL[idx] <= 0 or interCD[idx] <= 0:
-    #    return None
     interMetrics = [ReTheoretical,interCL[idx],interCM[idx],interCD[idx],interSink[idx]]
- 
     return interMetrics
-def scoreCandidates(validbool,chord_grid,span_grid,Velocity,mass,Re,table):
+def scoreCandidates(validbool,chord_grid,span_grid,cfg,mass,Re,table):
     results= []
     for i in range(span_grid.shape[0]):
         for j in range(np.argmax(validbool),chord_grid.shape[1]):
@@ -228,47 +231,56 @@ def scoreCandidates(validbool,chord_grid,span_grid,Velocity,mass,Re,table):
             max_iter=500
             _iter=0
             while _repeat:
-                interMetrics = _findOperatingPoint(table,testRe)
+                interMetrics = _findOperatingPoint(table,testRe,chord_grid[i,j],span_grid[i,j])
                 if interMetrics is None:
                     break
-                V = np.sqrt(2*mass[i,j]*9.81 / (1.225 * (chord_grid[i,j]/1000) * (span_grid[i,j]/1000) * interMetrics[1]))
+                V = np.sqrt(2*(mass[i,j]/1000)*9.81 / (1.225 * (chord_grid[i,j]/1000) * (span_grid[i,j]/1000) * interMetrics[1]))
                 Re_new = V * (chord_grid[i,j]/1000)/1.48e-5
                 if abs(Re_new - testRe)/testRe < .05:
                     _repeat = False
-                    if interMetrics[2]>-.15:
-                        results.append((interMetrics[4],chord_grid[i,j],span_grid[i,j],interMetrics[0],interMetrics[1],interMetrics[2],interMetrics[3]))
+                    if interMetrics[2]>-.15 and V < cfg.valid_glide:
+                        results.append((interMetrics[4],chord_grid[i,j],span_grid[i,j],interMetrics[0],interMetrics[1],interMetrics[2],interMetrics[3],V))
                 elif _iter >= max_iter:
                     _repeat= False
                     
                 else:
                     testRe = 0.7*testRe + .3*Re_new
                     _iter += 1
-                    print("converge")
-    
     #if not results:
      #   return None
     results.sort(reverse=True)
     return results[:5]
+def runSweep(cfg):
+    allresults=[]
+    workdir = os.path.join(os.getcwd(),"xfoil_work")
+    os.makedirs(workdir, exist_ok=True)
+    for M in range(cfg.M_min,cfg.M_max+1, cfg.M_step):
+        for P in range(cfg.P_min,cfg.P_max+1, cfg.P_step):
+            for T in range(cfg.T_min, cfg.T_max+1,cfg.T_step):
+                polardir = os.path.join(workdir, f"NACA{M}{P}{T:02d}")
+                os.makedirs(polardir, exist_ok=True)
+                coords,perimeter,thickness,xu = paraGen(M,P,T)
+                validbool,validpercent=mfCheck(cfg,thickness,xu)
+                if not np.any(validbool):
+                    continue
+                Re,chord_grid,span_grid, Velocity,mass=buildDesignSpace(perimeter,cfg)
+                filename,name=writeAirfoil(coords,M,P,T,polardir)
+                results,resweep = xfoilAnalysis(cfg,polardir,name)
+                table=polarTable(results,polardir)
+                if not table:
+                    continue
+                sucessfulCandidates=scoreCandidates(validbool,chord_grid,span_grid,cfg,mass,Re,table)
+                if not sucessfulCandidates:
+                    continue
+                for c in sucessfulCandidates:
+                    allresults.append((M,P,T,*c))
+                print(f"NACA{M}{P}{T:02d} done - {len(sucessfulCandidates)} candidates")
+    allresults.sort(reverse = True, key=lambda x: x[3])
+    return allresults[:10]
 #here we start the program provide the function with its params and sit printing profile
-M=4
-P=4
-T=12
+
 cfg = SweepConfig()
-workdir = os.path.join(os.getcwd(),"xfoil_work")
-os.makedirs(workdir, exist_ok=True)
-polardir = os.path.join(workdir, f"NACA{M}{P}{T:02d}")
-os.makedirs(polardir, exist_ok=True)
-coords,perimeter,thickness,xu = paraGen(M,P,T)
-Re,chord_grid,span_grid, Velocity,mass=buildDesignSpace(perimeter,cfg)
-validbool,validpercent=mfCheck(cfg,thickness,xu)
-filename,name=writeAirfoil(coords,M,P,T,polardir)
-results,resweep = xfoilAnalysis(cfg,polardir,name)
-table=polarTable(results,polardir)
-results=scoreCandidates(validbool,chord_grid,span_grid,Velocity,mass,Re,table)
+results = runSweep(cfg)
 print(results)
 
 #debugging 
-np.savetxt('weight_grid.csv', mass, delimiter=',', fmt='%.5g')
-plt.plot(coords[:,0], coords[:,1])
-plt.axis('equal')
-plt.show()
